@@ -64,23 +64,23 @@ int main() {
         using namespace test_dict;
         
         Header header;
-        stdcout(details::idx_of<Header, BeginString>::value);
-        stdcout(details::idx_of<Header, Length>::value);
-        stdcout(details::idx_of<Header, MsgType>::value);
         
-        header.set<MsgType>(String("A"));
+        //header.set<MsgType>(String("A"));
         header.set<MsgType>("A");
         
         String s;
         header.get<MsgType>(s);
         stdcout(s.value);
         
-        //header.set<Account>("FIX.4.4");
-        header.set<BeginString>("FIX.4.4");
-        header.set<SenderCompID>("MYCOMP");
-        header.set<TargetCompID>("THEIRTCOMP");
-        //header.omit<Length>();
-        //header.set<Length>(0);
+        // Chaining
+        header.set<BeginString> ("FIX.4.4")
+              .set<SenderCompID>("MYCOMP")
+              .set<TargetCompID>("THEIRTCOMP")
+              .set<MsgSeqNum>   (1);
+        
+        // Omitting
+        header.set<PossDupFlag>('Y');
+        header.clear<PossDupFlag>();
         
         header.serialize(buf);
         stdcout(replace_SOH(buf));
@@ -90,28 +90,84 @@ int main() {
         NewOrderSingle nos;
         nos.set<ClOrdID>("123ABC");
         nos.set<Account>("ololo//OLOLO");
-        nos.set<Price>(66.6625);
-        nos.set<Side>('2');
+        nos.set<Price>  (66.6625);
+        nos.set<Side>   ('2');
         
-        //NoPartyID parties;
-        auto& parties = nos.set<NoPartyID>();
-        parties[0].set<PartyID>("USER");
-        parties[1].set<PartyID>("FIRM");
+        // Group => 3 entries, chaining example
+        nos.at<NoPartyID>().resize(3);
+        nos.at<NoPartyID>()[0]
+            .set<PartyID>("USER")
+            .set<PartyRole>(12)
+            .set<PartyIDSource>('X');
+        
+        nos.at<NoPartyID>()[1]
+            .set<PartyID>("FIRM")
+            .set<PartyIDSource>('Y');
+        
+        nos.at<NoPartyID>()[2].set<PartyID>("KGB");
         
         nos.serialize(buf);
         stdcout(replace_SOH(buf));
         
         clrbuf();
         
-        auto written = serialize_body(buf, header, nos);
-        written += serialize_chksum(buf, written);
+        Trailer trailer;
+        serialize_message(buf, header, nos, trailer);
         stdcout(replace_SOH(buf));
-        stdcout(written);
+        
+        auto map = build_offsets_map(buf, sizeof(buf));
+        for(auto const& tag : {0}) {
+            auto range = map.equal_range(tag);
+            for(auto it = range.first; it != range.second; ++it)
+                stdprintf("%% at %%", it->first, it->second);
+        }
+        
+        auto account = extract_field<Account>(buf, map);
+        stdcout(account.value);
+        
+        nos.set<Account>("changed");
+        transfer_field<Account>(buf, nos, map);
+        stdcout(nos.at<Account>().value);
+        
+        account.clear();
+        account.deserialize(buf + map.find(account.tag)->second);
+        stdcout(account.value);
     }
     
     clrbuf();
     
     {
+        stdcout(null<Int>::value());
+        stdcout(null<Float>::value());
+        stdcout(int(null<Char>::value()));
+        stdcout(null<String>::value());
+        stdcout(null<Fixed<6>>::value());
         
+        using namespace test_dict;
+        
+        NestedGroupsOrder batch;
+        
+        batch.set<Account>("Nested!");
+        batch.set<Password>("PSSWD");
+        
+        std::array<std::string,3> ids = {"aaa", "bbb", "ccc"};
+        batch.at<NoOrders>().resize(ids.size());
+        
+        for(size_t i = 0; i < ids.size(); ++i) {
+            auto& order = batch.at<NoOrders>()[i];
+            order.set<ClOrdID>(ids[i]);
+            
+            std::array<std::string,3> parties = {"YOU", "ME", "KGB"};
+            order.at<NoPartyID>().resize(parties.size());
+            
+            for(size_t j = 0; j < parties.size(); ++j) {
+                order.at<NoPartyID>()[j]
+                    .set<PartyID>(parties[j])
+                    .set<PartyRole>(0);
+            }
+        }
+        
+        batch.serialize(buf);
+        stdcout(replace_SOH(buf));
     }
 }

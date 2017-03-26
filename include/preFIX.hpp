@@ -23,113 +23,79 @@ std::string replace_SOH(std::string str, char symbol = '|') {
     return str;
 }
 
-/*// Contains compile-time djb2 hash implementation
-namespace hash {
-    constexpr size_t djb2_impl(char const* str, size_t hash) {
-        return  *str == char{0} ? hash :
-                djb2_impl(str + 1, ((hash << 5) + hash) + *str);
-    }
-
-    constexpr size_t djb2(char const* str) {
-        return djb2_impl(str, 5381); }
-    
-    /// some_tpl<H("string")>
-    constexpr size_t H(char const* str) {
-        return djb2(str); }
-    
-    /// some_tpl<"string"__>
-    constexpr size_t operator ""__(char const* str, size_t) {
-        return H(str); }
-}
-
-namespace meta {
-    /// Concatenates two tuple-like classes
-    template <class U, class V>
-    struct tuple_concat;
-
-    template <
-        template <class...> class T,
-        class... Alist,
-        class... Blist
-    > struct tuple_concat<T<Alist...>, T<Blist...>> { using type = T<Alist..., Blist...>; };
-
-    template <typename U, typename V>
-    using tuple_concat_t = typename tuple_concat<U,V>::type;
-
-
-    /// Pushes type to tuple-like class
-    template <class Tuple, class T>
-    struct tuple_push;
-
-    template <
-        template <class...> class Tuple,
-        class... Args,
-        class T
-    > struct tuple_push<Tuple<Args...>,T> { using type = Tuple<Args..., T>; };
-
-    template <typename Tuple, typename T>
-    using tuple_push_t = typename tuple_push<Tuple,T>::type;
-}
-//*/
-
 /// Contains basic types arithmetics and mapping (FIX <=> native)
 namespace types {
+    namespace details {
+        /// Default serializer: {ostringstream(dst) << value}
+        template <typename T>
+        struct sstream_serializer {
+            template <typename U>
+            static size_t serialize(char* dst, U&& value, char delimiter = SOH) {
+                std::ostringstream ss; ss << std::forward<U>(value);
+                std::string str = ss.str();
+                std::memcpy(dst, str.data(), str.size());
+                dst[str.size()] = delimiter;
+                return str.size() + 1;
+            }
+        };
+        
+        /// Default deserializer: {istringstream(src) >> value}
+        template <typename T>
+        struct sstream_deserializer {
+            template <typename U>
+            static size_t deserialize(char const* src, U& value, char delimiter = SOH) {
+                std::string str(src, static_cast<char const*>(std::strchr(src, delimiter)));
+                std::istringstream ss(str); ss >> value;
+                return str.size() + 1;
+            }
+        };
+        
+        /// Special serializer for fixed-width integer (000123)
+        template <size_t Width>
+        struct fixed_width_int_serializer {
+            template <typename U>
+            static size_t serialize(char* dst, U&& value, char delimiter = SOH) {
+                std::ostringstream ss;
+                bool neg = (value < 0);
+                ss << (neg ? "-" : "")
+                   << std::setfill('0')
+                   << std::setw(Width - neg)
+                   << std::abs(std::forward<U>(value));
+                std::string str = ss.str();
+                std::memcpy(dst, str.data(), str.size());
+                dst[str.size()] = delimiter;
+                return str.size() + 1;
+            }
+        };
+    } // details
     
-    /// Default serializer: {ostringstream(dst) << value}
+    /// Contains static value() function returning null-value of given type
     template <typename T>
-    struct sstream_serializer {
-        template <typename U>
-        static size_t serialize(char* dst, U&& value, char delimiter = SOH) {
-            std::ostringstream ss; ss << std::forward<U>(value);
-            std::string str = ss.str();
-            std::memcpy(dst, str.data(), str.size());
-            dst[str.size()] = delimiter;
-            return str.size() + 1;
-        }
-    };
+    struct null;
     
-    /// Default deserializer: {istringstream(src) >> value}
-    template <typename T>
-    struct sstream_deserializer {
-        template <typename U>
-        static size_t deserialize(char const* src, U& value, char delimiter = SOH) {
-            std::string str(src, static_cast<char const*>(std::strchr(src, delimiter)));
-            std::istringstream ss(str); ss >> value;
-            return str.size() + 1;
-        }
-    };
-    
-    /// Special serializer
-    template <size_t Width>
-    struct fixed_width_int_serializer {
-        template <typename U>
-        static size_t serialize(char* dst, U&& value, char delimiter = SOH) {
-            std::ostringstream ss;
-            ss << std::setfill('0') << std::setw(Width) << std::forward<U>(value);
-            std::string str = ss.str();
-            std::memcpy(dst, str.data(), str.size());
-            dst[str.size()] = delimiter;
-            return str.size() + 1;
-        }
-    };
-    
+    /// Base class for all FIX data types
     template <
         typename T,
-        class serializer    = sstream_serializer<T>,
-        class deserializer  = sstream_deserializer<T>
-    >
+        class serializer    = details::sstream_serializer<T>,
+        class deserializer  = details::sstream_deserializer<T>
+    > struct base_t;
+    
+    template <typename T, class serializer, class deserializer>
     struct base_t : serializer, deserializer {
         using underlying_type = T;
         underlying_type value;
         
-        base_t() = default;
-        explicit base_t(underlying_type const& v) : value(v) {}
+        /// By default == null (data is not presented)
+        base_t() : value(null<base_t>::value()) {}
+        base_t(underlying_type const& v) : value(v) {}
         
-        template <typename U>
-        base_t& operator=(U&& v) {
-            value = std::forward<U>(v);
-            return *this;
-        }
+        /// Sets value to null
+        void clear() {
+            value = null<base_t>::value(); }
+        
+        /// @returns if value != null
+        bool present() const {
+            return value != null<base_t>::value(); }
         
         using serializer::serialize;
         using deserializer::deserialize;
@@ -141,13 +107,29 @@ namespace types {
             return deserialize(src, value); }
     };
     
-    using Int       = base_t<size_t>;
-    using Float     = base_t<double>;
-    using Char      = base_t<char>;
-    using String    = base_t<std::string>;
+    
+    /// ------------------------! Main FIX types !------------------------ ///
+    
+    using Int       = base_t<long>;         // FIX int
+    using Float     = base_t<double>;       // FIX float
+    using Char      = base_t<char>;         // FIX char
+    using String    = base_t<std::string>;  // FIX String
     
     template <size_t Width>
-    using Fixed = base_t<int, fixed_width_int_serializer<Width>>;
+    using Fixed = base_t<int, details::fixed_width_int_serializer<Width>>;
+    
+    
+    /// ------------------------! Their NULL values !------------------------ ///
+    
+    template <typename Base, typename U, typename V>
+    struct null<base_t<Base,U,V>> {
+        static_assert(std::is_arithmetic<Base>::value, LOG_HEAD "null isn't defined");
+        constexpr static Base value() { return std::numeric_limits<Base>::max(); }
+    };
+    
+    template <>
+    struct null<String> { static typename String::underlying_type value() { return {}; } };
+    
     
     /// Writes preamble: "TAG=", @returns populated size
     size_t serialize_tag(char* dst, int tag) {

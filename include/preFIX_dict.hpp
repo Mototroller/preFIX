@@ -1,14 +1,15 @@
 #pragma once
 
 #include <array>
+#include <list>
+#include <map>
 #include <tuple>
 #include <unordered_map>
+#include <vector>
 
 #include <preFIX.hpp>
 
-namespace preFIX {
-
-namespace dict {
+namespace preFIX { namespace dict {
     
     using namespace preFIX::types;
     
@@ -40,82 +41,123 @@ namespace dict {
             auto written = std::get<N>(t).serialize(dst); // member func
             return written + serialize_tuple<(N+1)>(dst + written, t);
         }
-    }
+    } // details
+    
+    
+    /// ------------------------! Main entries hierarchy !------------------------ ///
     
     /// Main tuple-like entity, contains fields to be serialized
     template <typename... T>
     class msg_t;
     
-    /// Base class for all plain fields
-    template <int tag_value, typename FIX_type>
-    struct field_base {
-        using type = FIX_type;
-        enum : int { tag = tag_value };
+    /**
+     * Aggregate type describing repeating group. Example:
+     * TAG=GROUP|
+     * TAG={NUM|HEAD=A|T1=B|T2=C|...HEAD=E|...TX=Z|}
+     */
+    template <typename Head, typename... Tail>
+    struct Group {
+        using group_element_type = msg_t<Head, Tail...>;
+        using underlying_type = std::vector<group_element_type>;
         
-        type data;
-        bool present = false;
+        underlying_type value;
+        
+        void clear() {
+            value.clear(); }
+        
+        bool present() const {
+            return !value.empty(); }
+        
+        size_t serialize(char* dst) const {
+            size_t written = 0, chunk = 0;
+            
+            chunk = Int::serialize(dst, int(value.size()));
+            written += chunk;
+            dst     += chunk;
+            
+            for(auto const& msg : value) {
+                chunk = msg.serialize(dst);
+                written += chunk;
+                dst     += chunk;
+            }
+            
+            return written;
+        }
+        
+        size_t deserialize(char const* src) {
+            size_t read = 0, chunk = 0;
+            Int::underlying_type group_size;
+            chunk = Int::deserialize(src, group_size);
+            read    += chunk;
+            src     += chunk;
+            
+            for(int i = 0; i < group_size; ++i) {
+                // msg.deserialize
+            }
+            
+            return read;
+        }
+        
+        /// ------------------------! Group interface !------------------------ ///
+        
+        Group& resize(size_t new_size) {
+            clear();
+            value.resize(new_size);
+            return *this;
+        }
+        
+        group_element_type const& operator[](size_t idx) const {
+            return value[idx]; }
+        
+        group_element_type& operator[](size_t idx) {
+            return value[idx]; }
+    };
+    
+    /**
+     * Base class for all fields. T requirements:
+     * - t.value (optional, instantiates on demand)
+     * - t.clear()
+     * - t.present()
+     * - t.serialize(dst)
+     */
+    template <int tag_value, typename T>
+    struct field_base : T {
+        using type = T;
+        enum : int { tag = tag_value };
         
         /// Performs standard serialization: "TAG=VALUE<SOH>", @returns written size
         size_t serialize(char* dst) const {
-            if(present) {
+            if(type::present()) {
                 size_t written = 0, chunk = 0;
                 chunk = types::serialize_tag(dst, tag);
                 written += chunk;
                 dst     += chunk;
-                return written + data.serialize(dst);
+                return written + type::serialize(dst);
             }
             return 0;
         }
+        
+        size_t deserialize(char const* src) {
+            size_t read = 0, chunk = 0;
+            int tag_val;
+            chunk = types::deserialize_tag(src, tag_val);
+            if(tag_val == tag) {
+                read    += chunk;
+                src     += chunk;
+                return read + type::deserialize(src);
+            }
+            
+            type::clear();
+            return 0;
+        }
+        
+        /// TODO: ADL + friend = WIN!
+        // friend void ololo(field_base const&) {}
     };
     
-    /// Base class for repetaing groups
-    template <int tag_value, size_t Size, typename... Fields>
-    struct group_base {
-        using atom_type = msg_t<Fields...>;
-        using type = std::array<atom_type, Size>;
-        enum : int { tag = tag_value };
-        
-        type data;
-        bool present = false;
-        
-        size_t serialize(char* dst) const {
-            if(present) {
-                int group_size = 0;
-                for(auto const& msg : data)
-                    group_size += msg.is_group_presented();
-                
-                if(group_size > 0) {
-                    size_t written = 0, chunk = 0;
-                    
-                    chunk = types::serialize_tag(dst, tag);
-                    written += chunk;
-                    dst     += chunk;
-                    
-                    chunk = types::Int::serialize(dst, int(group_size));
-                    written += chunk;
-                    dst     += chunk;
-                    
-                    for(auto const& msg : data) {
-                        chunk = msg.serialize(dst);
-                        written += chunk;
-                        dst     += chunk;
-                    }
-                    
-                    return written;
-                }
-            }
-            return 0;
-        }
-        
-        size_t max_size() const {
-            return data.size(); }
-        
-        atom_type const& operator[](size_t idx) const {
-            return data[idx]; }
-        
-        atom_type& operator[](size_t idx) {
-            return data[idx]; }
-    };
+    /// Alias for field containing repeating group
+    template <int tag_value, typename Head, typename... Tail>
+    using group_base = field_base<tag_value, Group<Head, Tail...>>;
     
     template <typename... T>
     class msg_t {
@@ -124,93 +166,137 @@ namespace dict {
         tuple_t fields_;
         
         template <typename U, size_t idx = details::idx_of<tuple_t, U>::value>
-        inline auto get_field() -> decltype(std::get<idx>(fields_)) {
+        inline U const& get_field() const {
             return std::get<idx>(fields_); }
         
         template <typename U, size_t idx = details::idx_of<tuple_t, U>::value>
-        inline auto get_field() const -> decltype(std::get<idx>(fields_)) {
+        inline U& get_field() {
             return std::get<idx>(fields_); }
         
     public:
-        /// For groups: @returns if first field of group was set
-        bool is_group_presented() const {
-            return std::get<0>(fields_).present; }
+        template <typename U>
+        inline U const& at() const {
+            return get_field<U>(); }
+        
+        template <typename U>
+        inline U& at() {
+            return get_field<U>(); }
         
         /// Assigns given value to field's data
         template <typename U, typename Arg>
-        void set(Arg&& arg) {
-            auto& field = get_field<U>();
-            field.data = std::forward<Arg>(arg);
-            field.present = true;
+        msg_t& set(Arg&& arg) {
+            auto& field = at<U>();
+            field.value = std::forward<Arg>(arg);
+            return *this;
         }
         
-        /// Returns mutable reference to underlying field/group
+        /// Set field to null == omitting during serialization
         template <typename U>
-        U& set() {
-            auto& field = get_field<U>();
-            field.present = true;
-            return field;
-        }
-        
-        /// Set field to be omitted during serialization
-        template <typename U>
-        void omit() {
-            get_field<U>().present = false; }
+        void clear() {
+            at<U>().clear(); }
         
         /// Extracts value from field
         template <typename U, typename Arg>
-        void get(Arg&& arg) const {
-            std::forward<Arg>(arg) = get_field<U>().data; }
-        
-        /// Returns constant reference to underlying field/group
-        template <typename U>
-        U const& get() const {
-            return get_field<U>(); }
+        msg_t const& get(Arg&& arg) const {
+            std::forward<Arg>(arg) = at<U>().value;
+            return *this;
+        }
         
         /// Recursively serializes fields to given buffer
         size_t serialize(char* dst) const {
             return details::serialize_tuple(dst, fields_); }
     };
     
-    struct BeginString  : field_base<8,     String      >{};
-    struct Length       : field_base<9,     Fixed<5>    >{};
-    struct CheckSum     : field_base<10,    Fixed<3>    >{};
     
-    template <typename H, typename Msg>
-    size_t serialize_body(char* dst, H& header, Msg const& msg) {
-        char* b_ptr = dst;
-        size_t written = 0, chunk = 0;
-        header.template set<Length>(0);
+    /// ------------------------! Mandatory fields !------------------------ ///
+    
+    struct BeginString  : field_base<8,     String      >{}; // Header.BeginString
+    struct Length       : field_base<9,     Fixed<5>    >{}; // Header.Length
+    struct CheckSum     : field_base<10,    Fixed<3>    >{}; // Trailer.CheckSum
+    
+    namespace details {
+        /// Performs header+body serialization and Length calculation
+        template <typename H, typename Msg>
+        size_t serialize_body(char* dst, H& header, Msg const& msg) {
+            char* b_ptr = dst;
+            size_t written = 0, chunk = 0;
+            header.template set<Length>(0);
+            
+            chunk = header.serialize(dst);
+            written += chunk;
+            dst     += chunk;
+            
+            chunk = msg.serialize(dst);
+            written += chunk;
+            dst     += chunk;
+            
+            auto l_ptr = std::find(b_ptr, dst, char(SOH)) + 1;
+            auto r_ptr = std::find(l_ptr, dst, char(SOH)) + 1;
+            
+            header.template set<Length>(written - (r_ptr - b_ptr));
+            header.template at<Length>().serialize(l_ptr);
+            
+            return written;
+        }
         
-        chunk = header.serialize(dst);
-        written += chunk;
-        dst     += chunk;
-        
-        chunk = msg.serialize(dst);
-        written += chunk;
-        dst     += chunk;
-        
-        auto l_ptr = std::find(b_ptr, dst, char(SOH)) + 1;
-        auto r_ptr = std::find(l_ptr, dst, char(SOH)) + 1;
-        
-        header.template set<Length>(written - (r_ptr - b_ptr));
-        header.template get<Length>().serialize(l_ptr);
-        
-        return written;
+        /// Performs trailer serialization and CheckSum calculation
+        template <typename T>
+        size_t serialize_trailer(char* base, size_t length, T& trailer) {
+            int sum = 0;
+            for(size_t i = 0; i < length; ++i)
+                sum += int(base[i]);
+            
+            trailer.template set<CheckSum>(sum % 256);
+            return trailer.serialize(base + length);
+        }
+    } // details
+    
+    /// Serializes given message (header+body+trailer) and fills Length and CheckSum
+    template <typename H, typename Msg, typename T>
+    size_t serialize_message(char* dst, H& header, Msg const& msg, T& trailer) {
+        size_t written = details::serialize_body(dst, header, msg); // so good
+        return written + details::serialize_trailer(dst, written, trailer);
     }
     
-    size_t serialize_chksum(char* base, size_t length) {
-        int sum = 0;
-        for(size_t i = 0; i < length; ++i)
-            sum += int(base[i]);
-        
-        using CS = msg_t<CheckSum>;
-        CS cs; cs.set<CheckSum>(sum % 256);
-        return cs.serialize(base + length);
+    
+    /// ------------------------! Deserialization !------------------------ ///
+    
+    /// tag <=> data coordinate
+    using offsets_map = std::unordered_multimap<int, size_t>;
+    
+    offsets_map build_offsets_map(char const* src, size_t size) {
+        offsets_map map; int tag;
+        for(size_t offset = 0; offset < size;) {
+            auto read = deserialize_tag(src + offset, tag);
+            map.emplace(tag, offset);
+            offset += read;
+            if(tag == CheckSum::tag) break;
+            while((offset < size) && (src[offset++] != SOH));
+        }
+        return map;
+    }
+    
+    template <typename Field>
+    Field extract_field(char const* src, offsets_map const& offsets) {
+        Field field;
+        auto it = offsets.find(Field::tag);
+        if(it != offsets.cend())
+            field.deserialize(src + it->second);
+        return field;
+    }
+    
+    template <typename Field, typename Msg>
+    bool transfer_field(char const* src, Msg& message, offsets_map const& offsets) {
+        auto it = offsets.find(Field::tag);
+        if(it != offsets.cend()) {
+            auto& field = message.template at<Field>();
+            field.deserialize(src + it->second);
+            return true;
+        }
+        return false;
     }
 
 } // dict
-    
 } // preFIX
 
 /// Example of FIX-dictionary
@@ -218,16 +304,18 @@ namespace test_dict {
     using namespace preFIX::types; // isn't necessary
     using namespace preFIX::dict;
     
-    
+    /// via "struct"
     struct MsgType      : field_base<35,    String> {};
     struct SenderCompID : field_base<49,    String> {};
     struct TargetCompID : field_base<56,    String> {};
     struct MsgSeqNum    : field_base<34,    Int>    {};
+    struct PossDupFlag  : field_base<43,    Char>   {};
     
-    struct Account      : field_base<1,     String> {};
-    struct EncryptMethod: field_base<98,    Int>    {};
-    struct HeartBtInt   : field_base<108,   Int>    {};
-    struct Password     : field_base<554,   String> {};
+    /// via "using"
+    using Account       = field_base<1,     String>;
+    using EncryptMethod = field_base<98,    Int>;
+    using HeartBtInt    = field_base<108,   Int>;
+    using Password      = field_base<554,   String>;
     
     struct ClOrdID      : field_base<11,    String> {};
     struct PartyID      : field_base<448,   String> {};
@@ -237,11 +325,11 @@ namespace test_dict {
     struct Side         : field_base<54,    Char>   {};
     
     
-    struct NoPartyID : group_base<453, 3,
+    using NoPartyID = group_base<453,
         PartyID,
         PartyIDSource,
         PartyRole
-    > {};
+    >;
     
     using Header = msg_t<
         BeginString,
@@ -249,7 +337,8 @@ namespace test_dict {
         MsgType,
         SenderCompID,
         TargetCompID,
-        MsgSeqNum
+        MsgSeqNum,
+        PossDupFlag
     >;
     
     using NewOrderSingle = msg_t<
@@ -258,6 +347,22 @@ namespace test_dict {
         NoPartyID,
         Price,
         Side
+    >;
+    
+    using Trailer = msg_t<
+        CheckSum
+    >;
+    
+    
+    struct NoOrders : group_base<999,
+        ClOrdID,
+        NoPartyID
+    > {};
+    
+    using NestedGroupsOrder = msg_t<
+        Account,
+        NoOrders,
+        Password
     >;
 
 } // test_dict
