@@ -1,9 +1,11 @@
 #pragma once
 
 #include <array>
+#include <bitset>
 #include <list>
 #include <map>
 #include <tuple>
+#include <unordered_set>
 #include <unordered_map>
 #include <vector>
 
@@ -28,19 +30,6 @@ namespace preFIX { namespace dict {
         template <template <class...> class tuple, typename T, typename U, typename... V>
         struct idx_of<tuple<U, V...>, T> : std::integral_constant<size_t, (1 + idx_of<tuple<V...>, T>::value)> {};
         
-        
-        /// Recursively calls "serialize" for every tuple element
-        template <size_t N = 0, typename Tuple>
-        auto serialize_tuple(char* dst, Tuple const& t) ->
-        typename std::enable_if<(N == std::tuple_size<Tuple>::value), size_t>::type {
-            return 0; }
-        
-        template <size_t N = 0, typename Tuple>
-        auto serialize_tuple(char* dst, Tuple const& t) ->
-        typename std::enable_if<(N != std::tuple_size<Tuple>::value), size_t>::type {
-            auto written = std::get<N>(t).serialize(dst); // member func
-            return written + serialize_tuple<(N+1)>(dst + written, t);
-        }
     } // details
     
     
@@ -56,7 +45,7 @@ namespace preFIX { namespace dict {
      * TAG={NUM|HEAD=A|T1=B|T2=C|...HEAD=E|...TX=Z|}
      */
     template <typename Head, typename... Tail>
-    struct Group {
+    struct Group : fix_value_base {
         using group_element_type = msg_t<Head, Tail...>;
         using underlying_type = std::vector<group_element_type>;
         
@@ -68,34 +57,27 @@ namespace preFIX { namespace dict {
         bool present() const {
             return !value.empty(); }
         
-        size_t serialize(char* dst) const {
-            size_t written = 0, chunk = 0;
-            
-            chunk = Int::serialize(dst, int(value.size()));
-            written += chunk;
-            dst     += chunk;
-            
-            for(auto const& msg : value) {
-                chunk = msg.serialize(dst);
-                written += chunk;
-                dst     += chunk;
+        virtual bool serialize(write_cursor& dst) const override {
+            Int group_size(value.size());
+            if(group_size.serialize(dst)) {
+                for(auto const& msg : value)
+                    if(!msg.serialize(dst))
+                        return false;
+                return true;
             }
-            
-            return written;
+            return false;
         }
         
-        size_t deserialize(char const* src) {
-            size_t read = 0, chunk = 0;
-            Int::underlying_type group_size;
-            chunk = Int::deserialize(src, group_size);
-            read    += chunk;
-            src     += chunk;
-            
-            for(int i = 0; i < group_size; ++i) {
-                // msg.deserialize
+        virtual bool deserialize(read_cursor& src) override {
+            Int group_size;
+            if(group_size.deserialize(src)) {
+                resize(group_size.value);
+                for(int i = 0; i < group_size.value; ++i)
+                    if(!value[i].deserialize(src))
+                        return false;
+                return true;
             }
-            
-            return read;
+            return false;
         }
         
         /// ------------------------! Group interface !------------------------ ///
@@ -126,29 +108,14 @@ namespace preFIX { namespace dict {
         enum : int { tag = tag_value };
         
         /// Performs standard serialization: "TAG=VALUE<SOH>", @returns written size
-        size_t serialize(char* dst) const {
+        bool serialize(write_cursor& dst) const {
             if(type::present()) {
-                size_t written = 0, chunk = 0;
-                chunk = types::serialize_tag(dst, tag);
-                written += chunk;
-                dst     += chunk;
-                return written + type::serialize(dst);
+                Int tag_val(tag);
+                if(serialize_tag(tag_val, dst))
+                    return type::serialize(dst);
+                return false;
             }
-            return 0;
-        }
-        
-        size_t deserialize(char const* src) {
-            size_t read = 0, chunk = 0;
-            int tag_val;
-            chunk = types::deserialize_tag(src, tag_val);
-            if(tag_val == tag) {
-                read    += chunk;
-                src     += chunk;
-                return read + type::deserialize(src);
-            }
-            
-            type::clear();
-            return 0;
+            return true;
         }
         
         /// TODO: ADL + friend = WIN!
@@ -173,6 +140,42 @@ namespace preFIX { namespace dict {
         inline U& get_field() {
             return std::get<idx>(fields_); }
         
+        bool deserialize_impl(read_cursor& src) {
+            using idx_map = preFIX::details::index_map<(T::tag)...>;
+            using filler = const int[sizeof...(T)];
+            
+            std::bitset<sizeof...(T)> found_idxes{};
+            std::array<fix_value_base*, sizeof...(T)> ptrs_arr;
+            (void)filler{(ptrs_arr[idx_map::idx_of(T::tag)] = &get_field<T>(), 0)...};
+            
+            while(src.left() > 0) {
+                // Here we have unread data
+                
+                Int tag;
+                auto left = src.left();
+                
+                if(!deserialize_tag(tag, src))
+                    return false;
+                
+                int idx = idx_map::idx_of(tag.value);
+                
+                // If tag is belonging to msg
+                if(idx != idx_map::size && !found_idxes[idx]) {
+                    found_idxes[idx].flip();
+                    auto value_ptr = ptrs_arr[idx];
+                    if(!value_ptr->deserialize(src))
+                        return false;
+                
+                // If tag has repeated or doesn't belong to msg
+                } else {
+                    src.step(src.left() - left); // step backward
+                    break;
+                }
+            }
+            // src.left() == 0 or unrecognized tag
+            return true;
+        }
+        
     public:
         template <typename U>
         inline U const& at() const {
@@ -185,8 +188,7 @@ namespace preFIX { namespace dict {
         /// Assigns given value to field's data
         template <typename U, typename Arg>
         msg_t& set(Arg&& arg) {
-            auto& field = at<U>();
-            field.value = std::forward<Arg>(arg);
+            at<U>().value = std::forward<Arg>(arg);
             return *this;
         }
         
@@ -202,9 +204,16 @@ namespace preFIX { namespace dict {
             return *this;
         }
         
+        
         /// Recursively serializes fields to given buffer
-        size_t serialize(char* dst) const {
-            return details::serialize_tuple(dst, fields_); }
+        bool serialize(write_cursor& dst) const {
+            bool res[] = {(get_field<T>().serialize(dst))...};
+            return std::accumulate(std::begin(res), std::end(res), 0) == sizeof...(T);
+        }
+        
+        /// Recursively parses given buffer
+        bool deserialize(read_cursor& src) {
+            return deserialize_impl(src); }
     };
     
     
@@ -217,84 +226,49 @@ namespace preFIX { namespace dict {
     namespace details {
         /// Performs header+body serialization and Length calculation
         template <typename H, typename Msg>
-        size_t serialize_body(char* dst, H& header, Msg const& msg) {
-            char* b_ptr = dst;
-            size_t written = 0, chunk = 0;
+        bool serialize_body(write_cursor& dst, H& header, Msg const& msg) {
+            char* b_ptr = dst.pointer();
+            int init_left = dst.left();
+            
             header.template set<Length>(0);
             
-            chunk = header.serialize(dst);
-            written += chunk;
-            dst     += chunk;
+            if(!header.serialize(dst) || !msg.serialize(dst))
+                return false;
             
-            chunk = msg.serialize(dst);
-            written += chunk;
-            dst     += chunk;
+            auto l_ptr = std::find(b_ptr, dst.pointer(), char(SOH)) + 1;
+            auto r_ptr = std::find(l_ptr, dst.pointer(), char(SOH)) + 1;
             
-            auto l_ptr = std::find(b_ptr, dst, char(SOH)) + 1;
-            auto r_ptr = std::find(l_ptr, dst, char(SOH)) + 1;
-            
+            int written = init_left - dst.left();
             header.template set<Length>(written - (r_ptr - b_ptr));
-            header.template at<Length>().serialize(l_ptr);
             
-            return written;
+            write_cursor lc(l_ptr, dst.pointer() - l_ptr);
+            return header.template at<Length>().serialize(lc);
         }
         
         /// Performs trailer serialization and CheckSum calculation
         template <typename T>
-        size_t serialize_trailer(char* base, size_t length, T& trailer) {
+        bool serialize_trailer(write_cursor& dst, T& trailer) {
+            auto base = dst.pointer() - dst.processed();
             int sum = 0;
-            for(size_t i = 0; i < length; ++i)
+            for(int i = 0; i < dst.processed(); ++i)
                 sum += int(base[i]);
             
             trailer.template set<CheckSum>(sum % 256);
-            return trailer.serialize(base + length);
+            return trailer.serialize(dst);
         }
     } // details
     
     /// Serializes given message (header+body+trailer) and fills Length and CheckSum
     template <typename H, typename Msg, typename T>
-    size_t serialize_message(char* dst, H& header, Msg const& msg, T& trailer) {
-        size_t written = details::serialize_body(dst, header, msg); // so good
-        return written + details::serialize_trailer(dst, written, trailer);
+    bool serialize_message(write_cursor& dst, H& header, Msg const& msg, T& trailer) {
+        return  details::serialize_body(dst, header, msg) &&
+                details::serialize_trailer(dst, trailer);
     }
     
     
     /// ------------------------! Deserialization !------------------------ ///
     
-    /// tag <=> data coordinate
-    using offsets_map = std::unordered_multimap<int, size_t>;
     
-    offsets_map build_offsets_map(char const* src, size_t size) {
-        offsets_map map; int tag;
-        for(size_t offset = 0; offset < size;) {
-            auto read = deserialize_tag(src + offset, tag);
-            map.emplace(tag, offset);
-            offset += read;
-            if(tag == CheckSum::tag) break;
-            while((offset < size) && (src[offset++] != SOH));
-        }
-        return map;
-    }
-    
-    template <typename Field>
-    Field extract_field(char const* src, offsets_map const& offsets) {
-        Field field;
-        auto it = offsets.find(Field::tag);
-        if(it != offsets.cend())
-            field.deserialize(src + it->second);
-        return field;
-    }
-    
-    template <typename Field, typename Msg>
-    bool transfer_field(char const* src, Msg& message, offsets_map const& offsets) {
-        auto it = offsets.find(Field::tag);
-        if(it != offsets.cend()) {
-            auto& field = message.template at<Field>();
-            field.deserialize(src + it->second);
-            return true;
-        }
-        return false;
-    }
 
 } // dict
 } // preFIX
@@ -305,11 +279,11 @@ namespace test_dict {
     using namespace preFIX::dict;
     
     /// via "struct"
-    struct MsgType      : field_base<35,    String> {};
-    struct SenderCompID : field_base<49,    String> {};
-    struct TargetCompID : field_base<56,    String> {};
-    struct MsgSeqNum    : field_base<34,    Int>    {};
-    struct PossDupFlag  : field_base<43,    Char>   {};
+    using MsgType       = field_base<35,    String>;
+    using SenderCompID  = field_base<49,    String>;
+    using TargetCompID  = field_base<56,    String>;
+    using MsgSeqNum     = field_base<34,    Int>;
+    using PossDupFlag   = field_base<43,    Char>;
     
     /// via "using"
     using Account       = field_base<1,     String>;
@@ -317,12 +291,12 @@ namespace test_dict {
     using HeartBtInt    = field_base<108,   Int>;
     using Password      = field_base<554,   String>;
     
-    struct ClOrdID      : field_base<11,    String> {};
-    struct PartyID      : field_base<448,   String> {};
-    struct PartyIDSource: field_base<447,   Char>   {};
-    struct PartyRole    : field_base<452,   Int>    {};
-    struct Price        : field_base<44,    Float>  {};
-    struct Side         : field_base<54,    Char>   {};
+    using ClOrdID       = field_base<11,    String>;
+    using PartyID       = field_base<448,   String>;
+    using PartyIDSource = field_base<447,   Char>;
+    using PartyRole     = field_base<452,   Int>;
+    using Price         = field_base<44,    Float>;
+    using Side          = field_base<54,    Char>;
     
     
     using NoPartyID = group_base<453,
@@ -354,10 +328,10 @@ namespace test_dict {
     >;
     
     
-    struct NoOrders : group_base<999,
+    using NoOrders = group_base<999,
         ClOrdID,
         NoPartyID
-    > {};
+    >;
     
     using NestedGroupsOrder = msg_t<
         Account,

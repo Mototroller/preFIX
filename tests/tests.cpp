@@ -25,18 +25,23 @@ int main() {
     
     auto clrbuf = [&buf]{ std::memset(buf, 0x0, sizeof(buf)); };
     
+    write_cursor wc(buf, sizeof(buf));
+    read_cursor  rc(buf, sizeof(buf));
+    
     {
         Int i;
         
         i.value = 13;
-        Int::serialize(buf, i.value);
+        i.serialize(wc.reset());
         str = buf;
         str = str.substr(0, str.size() - 1);
         stdcout(str);
         
-        int x;
-        Int::deserialize(buf, x);
-        stdcout(x);
+        i.clear();
+        i.deserialize(rc.reset(wc.processed()));
+        stdcout(i.value);
+        
+        LIGHT_TEST(wc.processed() == rc.processed());
     }
     
     clrbuf();
@@ -45,17 +50,16 @@ int main() {
         String s;
         
         s.value = "DHKDHK//HKHKHHJ";
-        String::serialize(buf, s.value);
+        s.serialize(wc.reset());
         str = buf;
         str = str.substr(0, str.size() - 1);
         stdcout(str);
         
-        std::string x;
-        String::deserialize(buf, x);
-        stdcout(x);
+        s.clear();
+        s.deserialize(rc.reset(wc.processed()));
+        stdcout(s.value);
         
-        String::deserialize("abcde9823|", x, '|');
-        stdcout(x);
+        LIGHT_TEST(wc.processed() == rc.processed());
     }
     
     clrbuf();
@@ -65,12 +69,7 @@ int main() {
         
         Header header;
         
-        //header.set<MsgType>(String("A"));
         header.set<MsgType>("A");
-        
-        String s;
-        header.get<MsgType>(s);
-        stdcout(s.value);
         
         // Chaining
         header.set<BeginString> ("FIX.4.4")
@@ -82,7 +81,7 @@ int main() {
         header.set<PossDupFlag>('Y');
         header.clear<PossDupFlag>();
         
-        header.serialize(buf);
+        LIGHT_TEST(header.serialize(wc.reset()));
         stdcout(replace_SOH(buf));
         
         clrbuf();
@@ -106,43 +105,72 @@ int main() {
         
         nos.at<NoPartyID>()[2].set<PartyID>("KGB");
         
-        nos.serialize(buf);
-        stdcout(replace_SOH(buf));
+        {
+            clrbuf();
+            LIGHT_TEST(nos.serialize(wc.reset()));
+            stdcout(replace_SOH(buf), "<---- ser");
+            
+            NewOrderSingle nos2;
+            LIGHT_TEST(nos2.deserialize(rc.reset(wc.processed())));
+            
+            LIGHT_TEST(wc.processed() == rc.processed());
+            stdprintf("%% %%", wc.processed(), rc.processed());
+            
+            clrbuf();
+            LIGHT_TEST(nos2.serialize(wc.reset()));
+            stdcout(replace_SOH(buf), "<---- des");
+        }
         
         clrbuf();
         
         Trailer trailer;
-        serialize_message(buf, header, nos, trailer);
+        LIGHT_TEST(serialize_message(wc.reset(), header, nos, trailer));
         stdcout(replace_SOH(buf));
         
-        auto map = build_offsets_map(buf, sizeof(buf));
-        for(auto const& tag : {0}) {
-            auto range = map.equal_range(tag);
-            for(auto it = range.first; it != range.second; ++it)
-                stdprintf("%% at %%", it->first, it->second);
+        /// Perf
+        if(1) {
+            const size_t N = 16_KIB;
+            size_t t = rdtsc();
+            for(size_t i = 0; i < N; ++i)
+                serialize_message(wc.reset(), header, nos, trailer);
+            t = rdtsc() - t;
+            stdprintf("=== Encoding NOS: %% ticks/msg, %% ticks/B",
+                double(t)/N, double(t)/(N*wc.processed()));
         }
         
-        auto account = extract_field<Account>(buf, map);
-        stdcout(account.value);
+        {
+            clrbuf();
+            header.serialize(wc.reset());
+            stdcout(replace_SOH(buf), "<---- ser");
+            
+            Header h2;
+            h2.deserialize(rc.reset());
+            
+            clrbuf();
+            h2.serialize(wc.reset());
+            stdcout(replace_SOH(buf), "<---- des");
+        }
         
-        nos.set<Account>("changed");
-        transfer_field<Account>(buf, nos, map);
-        stdcout(nos.at<Account>().value);
-        
-        account.clear();
-        account.deserialize(buf + map.find(account.tag)->second);
-        stdcout(account.value);
+        /// Perf
+        if(1) {
+            clrbuf();
+            nos.serialize(wc.reset());
+            
+            NewOrderSingle n2;
+            const size_t N = 16_KIB;
+            auto t = rdtsc();
+            for(size_t i = 0; i < N; ++i)
+                n2.deserialize(rc.reset(wc.processed()));
+            t = rdtsc() - t;
+            stdprintf("=== Decoding NOS: %% ticks/msg, %% ticks/B",
+                double(t)/N, double(t)/(N*rc.processed()));
+            LIGHT_TEST(wc.processed() == rc.processed());
+        }
     }
     
     clrbuf();
     
     {
-        stdcout(null<Int>::value());
-        stdcout(null<Float>::value());
-        stdcout(int(null<Char>::value()));
-        stdcout(null<String>::value());
-        stdcout(null<Fixed<6>>::value());
-        
         using namespace test_dict;
         
         NestedGroupsOrder batch;
@@ -160,14 +188,90 @@ int main() {
             std::array<std::string,3> parties = {"YOU", "ME", "KGB"};
             order.at<NoPartyID>().resize(parties.size());
             
-            for(size_t j = 0; j < parties.size(); ++j) {
+            for(size_t j = 0; j < parties.size(); ++j)
                 order.at<NoPartyID>()[j]
-                    .set<PartyID>(parties[j])
+                    .set<PartyID>  (parties[j])
                     .set<PartyRole>(0);
-            }
         }
         
-        batch.serialize(buf);
-        stdcout(replace_SOH(buf));
+        LIGHT_TEST(batch.serialize(wc.reset()));
+        stdcout(replace_SOH(buf), "<---- ser");
+        
+        if(1) {
+            NestedGroupsOrder n2;
+            LIGHT_TEST(n2.deserialize(rc.reset(wc.processed())));
+            LIGHT_TEST(wc.processed() == rc.processed());
+            
+            clrbuf();
+            LIGHT_TEST(n2.serialize(wc.reset()));
+            stdcout(replace_SOH(buf), "<---- des");
+        }
+        
+        /// Perf
+        if(1) {
+            NestedGroupsOrder n2;
+            const size_t N = 16_KIB;
+            auto t = rdtsc();
+            for(size_t i = 0; i < N; ++i)
+                n2.deserialize(rc.reset(wc.processed()));
+            t = rdtsc() - t;
+            stdprintf("=== Decoding NESTED: %% ticks/msg, %% ticks/B",
+                double(t)/N, double(t)/(N*rc.processed()));
+            LIGHT_TEST(wc.processed() == rc.processed());
+        }
+    }
+    
+    {
+        using namespace dict;
+        using namespace preFIX::details;
+        
+        using map1 = index_map<4,8,15,16,23,42>;
+        using map2 = index_map<16,8,23,42,15,4>;
+        
+        for(int i = 0; i < 50; ++i) {
+            LIGHT_TEST(map1::idx_of(i) == map2::idx_of(i));
+        }
+        
+        std::array<int, 6> keys = {4,8,15,16,23,42};
+        map_array<int, 4,8,15,16,23,42> m1(-1);
+        map_array<int, 16,8,23,42,15,4> m2(-1);
+        map_array<int, 42,23,16,15,8,4> m3(-1);
+        
+        static_assert(map_array_eq<decltype(m1), decltype(m2)>::value, "");
+        static_assert(map_array_eq<decltype(m2), decltype(m3)>::value, "");
+        static_assert(map_array_eq<decltype(m3), decltype(m1)>::value, "");
+        
+        LIGHT_TEST(decltype(m1)::idx_map::sorted_seq::to_array() == keys);
+        LIGHT_TEST(decltype(m2)::idx_map::sorted_seq::to_array() == keys);
+        LIGHT_TEST(decltype(m3)::idx_map::sorted_seq::to_array() == keys);
+        
+        LIGHT_TEST(std::memcmp(&m1, &m2, sizeof(m1)) == 0);
+        
+        for(int i = 0; i < 50; ++i) {
+            auto it = m1.find(i);
+            if(it) *it = i*10;
+            it = m2.find(i);
+            if(it) *it = i*10;
+        }
+        
+        LIGHT_TEST(std::memcmp(&m1, &m2, sizeof(m1)) == 0);
+        
+        for(auto key : keys) {
+            auto it = m2.find(key);
+            LIGHT_TEST(!!it);
+            if(key)
+                LIGHT_TEST(*it == 10*key);
+        }
+    }
+    
+    {
+        using namespace preFIX::types::details::example;
+        
+        for(long i : {-999,0,1,2,34,999,1000,1001,333333,999999999}) {
+            clrbuf();
+            itoa(buf, i);
+            stdprintf("%% -> {%%}, %% digits",
+                i, std::string(buf), digits(i));
+        }
     }
 }
